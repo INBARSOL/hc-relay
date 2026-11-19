@@ -1,0 +1,26 @@
+name: Housing Connect Relay
+
+on:
+  schedule:
+    # Every 15 minutes — matches the Worker's cron watchdog window
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    # Manual trigger for testing; pings healthcheck just like the scheduled run
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Fetch HC data and POST to Worker
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          API_SECRET: ${{ secrets.API_SECRET }}
+        run: node relay.mjs
