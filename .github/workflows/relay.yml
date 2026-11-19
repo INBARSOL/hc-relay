@@ -7,6 +7,10 @@ on:
   workflow_dispatch:
     # Manual trigger for testing; pings healthcheck just like the scheduled run
 
+concurrency:
+  group: relay
+  cancel-in-progress: false
+
 jobs:
   relay:
     runs-on: ubuntu-latest
