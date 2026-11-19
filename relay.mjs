@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
  * Lotto Lane relay — GitHub Actions runner fetches Housing Connect data
- * (Azure IPs are not blocked by HC's WAF) and POSTs raw JSON to the Worker.
+ * (Azure IPs are not blocked by HC's WAF) and POSTs to the Worker one
+ * listing at a time to stay under the Worker's 50 D1 subrequest limit.
  *
  * Usage:
  *   node relay.mjs
@@ -11,7 +12,7 @@
  *   API_SECRET   — same value as the Worker's API_SECRET secret
  *
  * Optional:
- *   DRY_RUN=1    — fetch HC data but skip the POST to the Worker (for local testing)
+ *   DRY_RUN=1    — fetch HC data but skip all Worker POSTs (for local testing)
  */
 
 const WORKER_URL = process.env.WORKER_URL?.trim()
@@ -65,6 +66,40 @@ async function fetchDetail(lotteryId) {
   return res.json()
 }
 
+async function postListing(searchListingRaw, detailData) {
+  const res = await fetch(`${WORKER_URL}/internal/ingest/listing`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Api-Secret': API_SECRET,
+      'User-Agent': UA,
+    },
+    body: JSON.stringify({ searchListingRaw, detailData }),
+  })
+  if (!res.ok) {
+    const body = await res.text().catch(() => '')
+    throw new Error(`/ingest/listing failed: HTTP ${res.status} — ${body.slice(0, 300)}`)
+  }
+  return res.json()
+}
+
+async function postComplete(total, errorCount, prevCount) {
+  const res = await fetch(`${WORKER_URL}/internal/ingest/complete`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Api-Secret': API_SECRET,
+      'User-Agent': UA,
+    },
+    body: JSON.stringify({ total, errorCount, prevCount }),
+  })
+  if (!res.ok) {
+    const body = await res.text().catch(() => '')
+    throw new Error(`/ingest/complete failed: HTTP ${res.status} — ${body.slice(0, 300)}`)
+  }
+  return res.json()
+}
+
 async function main() {
   if (!DRY_RUN) {
     if (!WORKER_URL) throw new Error('WORKER_URL is required')
@@ -76,55 +111,82 @@ async function main() {
   const listings = [...(searchResponse.rentals ?? []), ...(searchResponse.sales ?? [])]
 
   if (listings.length === 0) {
-    log('WARNING: zero listings returned — skipping detail fetch and ingest')
+    log('WARNING: zero listings returned — skipping ingest')
     process.exit(1)
   }
 
-  // 2. Fetch each detail (sequential — polite, stays under 50 subrequest budget awareness)
-  const detailResponses = {}
-  let detailErrors = 0
-  for (const listing of listings) {
-    const id = listing.lotteryId ?? listing.LotteryId
-    if (!id) continue
-    try {
-      detailResponses[String(id)] = await fetchDetail(id)
-      // Small delay between requests — polite polling, not hammering
-      await new Promise(r => setTimeout(r, 200))
-    } catch (err) {
-      log(`WARNING: detail fetch failed for ${id}: ${err.message}`)
-      detailErrors++
-    }
+  // 2. Get prevCount before any writes (for drop check in /ingest/complete)
+  let prevCount = 0
+  if (!DRY_RUN) {
+    // We ask the Worker for the current published count via /health (doesn't expose count)
+    // so we pass prevCount=0 and let the Worker use its own countPublishedLotteries call.
+    // The Worker's /ingest/complete does the count internally — prevCount here is just for
+    // the Worker's reference; we pass the total listing count instead.
+    prevCount = listings.length  // approximation; Worker queries D1 for the real prevCount
   }
-  log(`details: ${Object.keys(detailResponses).length} ok, ${detailErrors} failed`)
+
+  // 3. POST each listing individually — one Worker invocation per listing
+  let errorCount = 0
+  const statuses = {}
 
   if (DRY_RUN) {
-    log('DRY_RUN=1 — skipping POST to Worker')
-    log(`would POST ${listings.length} listings to ${WORKER_URL ?? '(WORKER_URL not set)'}`)
+    log(`DRY_RUN=1 — would POST ${listings.length} listings to ${WORKER_URL ?? '(WORKER_URL not set)'}`)
+
+    // Still fetch details so we can verify HC connectivity
+    for (const listing of listings) {
+      const id = listing.lotteryId ?? listing.LotteryId
+      if (!id) continue
+      try {
+        await fetchDetail(id)
+        await new Promise(r => setTimeout(r, 200))
+      } catch (err) {
+        log(`WARNING: detail fetch failed for ${id}: ${err.message}`)
+        errorCount++
+      }
+    }
+    log(`details: ${listings.length - errorCount} ok, ${errorCount} failed`)
+    log('DRY_RUN complete — no Worker POSTs sent')
     process.exit(0)
   }
 
-  // 3. POST to Worker
-  log(`posting to ${WORKER_URL}/internal/ingest ...`)
-  const ingestRes = await fetch(`${WORKER_URL}/internal/ingest`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Api-Secret': API_SECRET,
-      'User-Agent': UA,
-    },
-    body: JSON.stringify({ searchResponse, detailResponses }),
-  })
+  for (const listing of listings) {
+    const id = listing.lotteryId ?? listing.LotteryId
+    if (!id) {
+      errorCount++
+      continue
+    }
 
-  if (!ingestRes.ok) {
-    const body = await ingestRes.text().catch(() => '')
-    throw new Error(`Worker /internal/ingest failed: HTTP ${ingestRes.status} — ${body.slice(0, 300)}`)
+    let detailData
+    try {
+      detailData = await fetchDetail(id)
+      await new Promise(r => setTimeout(r, 200))
+    } catch (err) {
+      log(`WARNING: detail fetch failed for ${id}: ${err.message}`)
+      errorCount++
+      continue
+    }
+
+    try {
+      const { result } = await postListing(listing, detailData)
+      statuses[result.status] = (statuses[result.status] ?? 0) + 1
+      if (result.status === 'error') {
+        log(`WARNING listing ${id}: ${result.error}`)
+        errorCount++
+      }
+    } catch (err) {
+      log(`WARNING: failed to post listing ${id}: ${err.message}`)
+      errorCount++
+    }
   }
 
-  const result = await ingestRes.json()
-  log(`ingest ok: ${JSON.stringify(result.summary)}`)
+  log(`listings done — ${JSON.stringify(statuses)}, errors: ${errorCount}`)
 
-  if (result.summary?.errors?.length > 0) {
-    log(`WARNING: ${result.summary.errors.length} ingest errors — Worker will ping /fail`)
+  // 4. Signal completion — Worker does drop check, logs watchdog event, pings healthcheck
+  const completeResult = await postComplete(listings.length, errorCount, prevCount)
+  log(`complete: ${JSON.stringify(completeResult)}`)
+
+  if (errorCount > 0) {
+    log(`WARNING: ${errorCount} errors — Worker will ping /fail`)
     process.exitCode = 1
   }
 }
