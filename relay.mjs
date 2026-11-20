@@ -83,7 +83,7 @@ async function postListing(searchListingRaw, detailData) {
   return res.json()
 }
 
-async function postComplete(total, errorCount, prevCount) {
+async function postComplete(total, errorCount, prevCount, observedIds) {
   const res = await fetch(`${WORKER_URL}/internal/ingest/complete`, {
     method: 'POST',
     headers: {
@@ -91,7 +91,7 @@ async function postComplete(total, errorCount, prevCount) {
       'X-Api-Secret': API_SECRET,
       'User-Agent': UA,
     },
-    body: JSON.stringify({ total, errorCount, prevCount }),
+    body: JSON.stringify({ total, errorCount, prevCount, observedIds }),
   })
   if (!res.ok) {
     const body = await res.text().catch(() => '')
@@ -128,6 +128,8 @@ async function main() {
   // 3. POST each listing individually — one Worker invocation per listing
   let errorCount = 0
   const statuses = {}
+  // All IDs observed in this run (regardless of per-listing errors) — used for ghost detection.
+  const observedIds = listings.map(l => String(l.lotteryId ?? l.LotteryId)).filter(Boolean)
 
   if (DRY_RUN) {
     log(`DRY_RUN=1 — would POST ${listings.length} listings to ${WORKER_URL ?? '(WORKER_URL not set)'}`)
@@ -181,8 +183,8 @@ async function main() {
 
   log(`listings done — ${JSON.stringify(statuses)}, errors: ${errorCount}`)
 
-  // 4. Signal completion — Worker does drop check, logs watchdog event, pings healthcheck
-  const completeResult = await postComplete(listings.length, errorCount, prevCount)
+  // 4. Signal completion — Worker does drop check, ghost reconcile, logs watchdog event, pings healthcheck
+  const completeResult = await postComplete(listings.length, errorCount, prevCount, observedIds)
   log(`complete: ${JSON.stringify(completeResult)}`)
 
   if (errorCount > 0) {
