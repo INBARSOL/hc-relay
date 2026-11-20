@@ -83,7 +83,39 @@ async function postListing(searchListingRaw, detailData) {
   return res.json()
 }
 
-async function postComplete(total, errorCount, prevCount, observedIds) {
+/**
+ * Validate photo URLs with HEAD requests. Returns urls that return HTTP 200
+ * with an image/* content-type. Silently drops failures.
+ * Also accumulates global photo stats for the owner alert in /ingest/complete.
+ */
+async function validatePhotoUrls(urls) {
+  const valid = []
+  for (const url of urls) {
+    try {
+      const res = await fetch(url, {
+        method: 'HEAD',
+        headers: { 'User-Agent': UA },
+        signal: AbortSignal.timeout(5000),
+      })
+      const ct = res.headers.get('content-type') ?? ''
+      if (res.ok && ct.startsWith('image/')) {
+        valid.push(url)
+      } else {
+        log(`WARNING: photo HEAD failed ${url} — HTTP ${res.status} content-type=${ct}`)
+        globalPhotoStats.failed++
+      }
+    } catch (err) {
+      log(`WARNING: photo HEAD error ${url}: ${err.message}`)
+      globalPhotoStats.failed++
+    }
+    globalPhotoStats.validated++
+  }
+  return valid
+}
+
+const globalPhotoStats = { validated: 0, failed: 0 }
+
+async function postComplete(total, errorCount, prevCount, observedIds, photoStats) {
   const res = await fetch(`${WORKER_URL}/internal/ingest/complete`, {
     method: 'POST',
     headers: {
@@ -91,7 +123,7 @@ async function postComplete(total, errorCount, prevCount, observedIds) {
       'X-Api-Secret': API_SECRET,
       'User-Agent': UA,
     },
-    body: JSON.stringify({ total, errorCount, prevCount, observedIds }),
+    body: JSON.stringify({ total, errorCount, prevCount, observedIds, photoStats }),
   })
   if (!res.ok) {
     const body = await res.text().catch(() => '')
@@ -168,6 +200,13 @@ async function main() {
       continue
     }
 
+    // Validate photo URLs from the detail response before POSTing.
+    if (Array.isArray(detailData.photos)) {
+      const rawUrls = detailData.photos.map(p => p.item1).filter(Boolean)
+      const validUrls = await validatePhotoUrls(rawUrls)
+      detailData = { ...detailData, photos: detailData.photos.filter(p => validUrls.includes(p.item1)) }
+    }
+
     try {
       const { result } = await postListing(listing, detailData)
       statuses[result.status] = (statuses[result.status] ?? 0) + 1
@@ -184,7 +223,7 @@ async function main() {
   log(`listings done — ${JSON.stringify(statuses)}, errors: ${errorCount}`)
 
   // 4. Signal completion — Worker does drop check, ghost reconcile, logs watchdog event, pings healthcheck
-  const completeResult = await postComplete(listings.length, errorCount, prevCount, observedIds)
+  const completeResult = await postComplete(listings.length, errorCount, prevCount, observedIds, globalPhotoStats)
   log(`complete: ${JSON.stringify(completeResult)}`)
 
   if (errorCount > 0) {
