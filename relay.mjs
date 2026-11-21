@@ -162,6 +162,62 @@ function computeNearby(lat, lng) {
   return { subway: nearestSubway, bus: nearestBus, schools, parks, museums, everyday }
 }
 
+// ---------------------------------------------------------------------------
+// Geocoding — NYC GeoSearch (Pelias, planninglabs.nyc)
+// Called only when HC provides no lat/lng for a building.
+// Accepts confident matches in the same borough; rejects "fallback" matches.
+// ---------------------------------------------------------------------------
+
+const GEOSEARCH_URL = 'https://geosearch.planninglabs.nyc/v2/search'
+
+/** Map HC borough codes / names → GeoSearch borough names. */
+const BOROUGH_MAP = {
+  MN: 'Manhattan', BK: 'Brooklyn', QN: 'Queens', BX: 'Bronx', SI: 'Staten Island',
+  MANHATTAN: 'Manhattan', BROOKLYN: 'Brooklyn', QUEENS: 'Queens', BRONX: 'Bronx',
+  'STATEN ISLAND': 'Staten Island',
+}
+
+/**
+ * Geocode a building address using NYC GeoSearch.
+ * Returns {lat, lng} only when the result is a confident match in the same
+ * borough. Returns null on network error, no results, or borough mismatch.
+ */
+async function geocodeAddress(address, city, borough) {
+  try {
+    const query = [address, city, 'NY'].filter(Boolean).join(', ')
+    const url = `${GEOSEARCH_URL}?text=${encodeURIComponent(query)}&size=1`
+    const res = await fetch(url, {
+      headers: { 'User-Agent': UA },
+      signal: AbortSignal.timeout(5000),
+    })
+    if (!res.ok) return null
+    const data = await res.json()
+
+    const feature = data.features?.[0]
+    if (!feature) return null
+
+    const [lng, lat] = feature.geometry?.coordinates ?? []
+    if (typeof lat !== 'number' || typeof lng !== 'number') return null
+
+    // NYC bounding box sanity check
+    if (lat < 40.4 || lat > 40.95 || lng < -74.3 || lng > -73.65) return null
+
+    // Reject "fallback" matches — too coarse
+    if (feature.properties?.match_type === 'fallback') return null
+
+    // Borough check: must match the listing's borough (when known)
+    const expectedBorough = BOROUGH_MAP[borough?.toUpperCase?.() ?? ''] ?? null
+    if (expectedBorough) {
+      const featureBorough = feature.properties?.borough
+      if (featureBorough && featureBorough.toLowerCase() !== expectedBorough.toLowerCase()) return null
+    }
+
+    return { lat, lng }
+  } catch {
+    return null
+  }
+}
+
 const HC_API = 'https://a806-housingconnectapi.nyc.gov/HPDPublicAPI/api/Lottery/'
 const CONTACT_URL = 'https://github.com/INBARSOL/lotto-lane-relay'
 const UA = `LottoLane/1.0 (${CONTACT_URL})`
@@ -354,8 +410,19 @@ async function main() {
     // Compute nearby transit/parks here (GitHub Actions has no CPU limit).
     // HC detail API nests lat/lng inside lotteryBuildings[0], not at the top level.
     const building = Array.isArray(detailData.lotteryBuildings) ? detailData.lotteryBuildings[0] : null
-    const lat = building?.latitude ?? building?.Latitude ?? detailData.latitude ?? detailData.Latitude ?? null
-    const lng = building?.longitude ?? building?.Longitude ?? detailData.longitude ?? detailData.Longitude ?? null
+    let lat = building?.latitude ?? building?.Latitude ?? detailData.latitude ?? detailData.Latitude ?? null
+    let lng = building?.longitude ?? building?.Longitude ?? detailData.longitude ?? detailData.Longitude ?? null
+
+    // If HC provided no coordinates, geocode via NYC GeoSearch.
+    if ((lat == null || lng == null) && building?.address) {
+      const coords = await geocodeAddress(building.address, building.city, listing.borough)
+      if (coords) {
+        lat = String(coords.lat)
+        lng = String(coords.lng)
+        log(`geocoded listing ${id}: ${building.address} → ${coords.lat},${coords.lng}`)
+      }
+    }
+
     const nearby = computeNearby(
       lat != null ? parseFloat(lat) : null,
       lng != null ? parseFloat(lng) : null,
