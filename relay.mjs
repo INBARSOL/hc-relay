@@ -302,6 +302,7 @@ async function main() {
 
   // 3. POST each listing individually — one Worker invocation per listing
   let errorCount = 0
+  let nearbyCount = 0
   const statuses = {}
   // All IDs observed in this run (regardless of per-listing errors) — used for ghost detection.
   const observedIds = listings.map(l => String(l.lotteryId ?? l.LotteryId)).filter(Boolean)
@@ -351,12 +352,15 @@ async function main() {
     }
 
     // Compute nearby transit/parks here (GitHub Actions has no CPU limit).
-    const lat = detailData.latitude ?? detailData.Latitude ?? null
-    const lng = detailData.longitude ?? detailData.Longitude ?? null
+    // HC detail API nests lat/lng inside lotteryBuildings[0], not at the top level.
+    const building = Array.isArray(detailData.lotteryBuildings) ? detailData.lotteryBuildings[0] : null
+    const lat = building?.latitude ?? building?.Latitude ?? detailData.latitude ?? detailData.Latitude ?? null
+    const lng = building?.longitude ?? building?.Longitude ?? detailData.longitude ?? detailData.Longitude ?? null
     const nearby = computeNearby(
       lat != null ? parseFloat(lat) : null,
       lng != null ? parseFloat(lng) : null,
     )
+    if (nearby) nearbyCount++
 
     try {
       const { result } = await postListing(listing, detailData, nearby)
@@ -371,6 +375,7 @@ async function main() {
     }
   }
 
+  log(`nearby computed for ${nearbyCount} of ${listings.length} listings`)
   log(`listings done — ${JSON.stringify(statuses)}, errors: ${errorCount}`)
 
   // 4. Signal completion — Worker does drop check, ghost reconcile, logs watchdog event, pings healthcheck
