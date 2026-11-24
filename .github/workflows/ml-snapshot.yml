@@ -1,0 +1,38 @@
+name: Mitchell-Lama Snapshot
+
+on:
+  schedule:
+    # 1st of each month at 06:00 UTC
+    - cron: '0 6 1 * *'
+  workflow_dispatch:
+    # Manual trigger for testing
+
+concurrency:
+  group: ml-snapshot
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install pdf-parse
+        run: npm install pdf-parse
+
+      - name: Download HPD LNA PDF
+        run: |
+          curl -sSL -o ml-lna.pdf \
+            "https://www.nyc.gov/assets/hpd/downloads/pdfs/services/mitchell-lama-last-number-approved.pdf"
+
+      - name: Parse and POST to Worker
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          API_SECRET: ${{ secrets.API_SECRET }}
+        run: node ml-snapshot.mjs
