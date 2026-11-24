@@ -24,14 +24,9 @@ jobs:
           node-version: '22'
 
       - name: Install pdf-parse
-        run: npm install pdf-parse
+        run: npm install pdf-parse@2.4.5
 
-      - name: Download HPD LNA PDF
-        run: |
-          curl -sSL -o ml-lna.pdf \
-            "https://www.nyc.gov/assets/hpd/downloads/pdfs/services/mitchell-lama-last-number-approved.pdf"
-
-      - name: Parse and POST to Worker
+      - name: Download, parse and POST to Worker
         env:
           WORKER_URL: ${{ secrets.WORKER_URL }}
           API_SECRET: ${{ secrets.API_SECRET }}

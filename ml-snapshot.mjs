@@ -2,197 +2,159 @@
  * ml-snapshot.mjs
  *
  * Run by GitHub Actions on the 1st of each month.
- * Expects ml-lna.pdf to have been downloaded already (see ml-snapshot.yml).
+ * Downloads the HPD Mitchell-Lama LNA PDF, parses it, and POSTs the
+ * snapshot to the Worker's /internal/ml-snapshot route.
  *
  * Required environment variables:
- *   WORKER_URL   - base URL of the Worker, e.g. https://lotto-lane-api.nyc-housing-app.workers.dev
+ *   WORKER_URL   - base URL of the Worker
  *   API_SECRET   - value of the API_SECRET Worker secret
+ *
+ * CLI options:
+ *   --file <path>   Skip the download and parse a local PDF instead (for testing).
+ *                   Example:
+ *                     node ml-snapshot.mjs --file ../../samples/mitchell-lama-lna-sample.pdf
+ *                   When --file is used, WORKER_URL / API_SECRET are not required
+ *                   unless --post is also passed.
+ *   --post          Even with --file, POST the result to the Worker.
  */
 
-import { createRequire } from 'module';
-import { readFileSync } from 'fs';
-import { resolve, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { writeFileSync } from 'fs'
+import { resolve, dirname } from 'path'
+import { fileURLToPath } from 'url'
+import { parseMitchellLamaLNA } from './parse-ml-last-number.mjs'
 
-const __dir = dirname(fileURLToPath(import.meta.url));
-const require = createRequire(import.meta.url);
-const { PDFParse } = require('pdf-parse');
+const __dir = dirname(fileURLToPath(import.meta.url))
 
-const SOURCE_URL = 'https://www.nyc.gov/assets/hpd/downloads/pdfs/services/mitchell-lama-last-number-approved.pdf';
-const BEDROOM_TYPES = ['studio', '1br', '2br', '3br', '4br'];
-const DATE_RE = /^\d{1,2}\/\d{1,2}\/\d{4}$/;
-const INT_RE = /^\d+$/;
-const SKIP_LINE_RE = /^(Mitchell-Lama Waiting Lists|Development\s*\t|--\s*\d+ of \d+\s*--)/i;
-const UPDATED_LINE_RE = /^Updated\s+(\d{1,2}\/\d{1,2}\/\d{4})/i;
-const HEADER_NAME_RE = /\b(Bedroom|Contact Info|Last Approval|Management Company|Studio Last|Status)\b/i;
+const SOURCE_URL =
+  'https://www.nyc.gov/assets/hpd/downloads/pdfs/services/mitchell-lama-last-number-approved.pdf'
 
-async function extractText(pdfPath) {
-  const absPath = resolve(pdfPath);
-  const fileUrl = 'file:///' + absPath.replace(/\\/g, '/');
-  const parser = new PDFParse({ url: fileUrl });
-  const result = await parser.getText();
-  return typeof result === 'string' ? result : result.text;
-}
+// ---------------------------------------------------------------------------
+// CLI flags
+// ---------------------------------------------------------------------------
+const args = process.argv.slice(2)
+const fileIdx = args.indexOf('--file')
+const localFile = fileIdx >= 0 ? args[fileIdx + 1] : null
+const forcePost = args.includes('--post')
 
-function cleanText(raw) {
-  let pdfUpdated = null;
-  const cleaned = raw
-    .split('\n')
-    .filter(line => {
-      const t = line.trim();
-      const updMatch = t.match(UPDATED_LINE_RE);
-      if (updMatch) {
-        if (!pdfUpdated) {
-          const [m, d, y] = updMatch[1].split('/').map(Number);
-          pdfUpdated = `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
-        }
-        return false;
+// ---------------------------------------------------------------------------
+// Download with redirect-following, browser User-Agent, and up to 3 retries.
+// Validates that the response is an actual PDF before saving the file.
+// ---------------------------------------------------------------------------
+async function downloadPdf(url, destPath, maxRetries = 3) {
+  let lastErr
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    if (attempt > 1) {
+      const wait = attempt * 2000
+      console.log(`[ml-snapshot] Retry ${attempt}/${maxRetries} in ${wait / 1000}s…`)
+      await new Promise(r => setTimeout(r, wait))
+    }
+    try {
+      const res = await fetch(url, {
+        redirect: 'follow',
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (compatible; LottoLaneBot/1.0; +https://lotto-lane-web.pages.dev)',
+          Accept: 'application/pdf,*/*',
+        },
+      })
+
+      if (!res.ok) {
+        const preview = await res.text().then(t => t.slice(0, 300)).catch(() => '')
+        throw new Error(
+          `HTTP ${res.status} ${res.statusText} — ` +
+          `Content-Type: ${res.headers.get('content-type') ?? 'unknown'} — ` +
+          `body: ${preview}`,
+        )
       }
-      return !SKIP_LINE_RE.test(t);
-    })
-    .join('\n');
-  return { cleaned, pdfUpdated };
-}
 
-function splitIntoEntries(text) {
-  const rawChunks = text.split(/(?<=\(\d{3}\)[-.\s]\d{3}[-.\s]\d{4})\n/);
-  return rawChunks
-    .map(e => e.trim())
-    .filter(e => e.includes('Last Number') && e.includes('\t'));
-}
+      const buf = Buffer.from(await res.arrayBuffer())
 
-function tokenise(tabGroup) {
-  return tabGroup.split('\n').map(s => s.trim()).filter(Boolean);
-}
-
-function isDateOrNA(tok) {
-  return tok === 'N/A' || DATE_RE.test(tok);
-}
-
-function isNumber(tok) {
-  return INT_RE.test(tok);
-}
-
-function parseEntry(entry) {
-  const tabs = entry.split('\t');
-  const lnTabIdx = tabs.findIndex(t => t.includes('Last Number'));
-  if (lnTabIdx < 0) return null;
-
-  let devRaw;
-  let extraFromStatus = '';
-  let dataStart;
-
-  if (lnTabIdx === 0) {
-    const lnIdx = tabs[0].indexOf('Last Number');
-    devRaw = tabs[0].substring(0, lnIdx);
-    const approvedIdx = tabs[0].indexOf('Approved');
-    if (approvedIdx >= 0) {
-      const tail = tabs[0].substring(approvedIdx + 'Approved'.length);
-      if (tail.trim()) extraFromStatus = tail;
-    }
-    dataStart = 1;
-  } else {
-    const prevTab = tabs[lnTabIdx - 1] || '';
-    const prevLines = prevTab.split('\n').map(s => s.trim()).filter(Boolean);
-    devRaw = prevLines[prevLines.length - 1] ?? prevTab;
-    const lnTab = tabs[lnTabIdx];
-    const approvedIdx = lnTab.indexOf('Approved');
-    if (approvedIdx >= 0) {
-      const tail = lnTab.substring(approvedIdx + 'Approved'.length);
-      if (tail.trim()) extraFromStatus = tail;
-    }
-    dataStart = lnTabIdx + 1;
-  }
-
-  const name = devRaw.replace(/\n/g, ' ').replace(/\s+/g, ' ').trim();
-  if (!name || HEADER_NAME_RE.test(name)) return null;
-
-  const contact = (tabs[tabs.length - 1] || '').trim();
-  const management = (tabs[tabs.length - 2] || '').trim();
-
-  const extraTokens = extraFromStatus ? tokenise(extraFromStatus) : [];
-  const middleTabs = tabs.slice(dataStart, tabs.length - 2);
-  const tokens = [...extraTokens, ...middleTabs.flatMap(tokenise)];
-
-  if (tokens.length < 10) return null;
-
-  const dateTokens = [];
-  let i = tokens.length - 1;
-  while (i >= 0 && dateTokens.length < 5) {
-    dateTokens.unshift(tokens[i]);
-    i--;
-  }
-  const countTokens = tokens.slice(0, i + 1);
-
-  const bedrooms = [];
-  let j = 0;
-  while (j < countTokens.length && bedrooms.length < 5) {
-    const tok = countTokens[j];
-    if (tok === 'N/A') {
-      bedrooms.push({ count: null, annotation: null });
-      j++;
-    } else if (isNumber(tok)) {
-      let annotation = '';
-      j++;
-      while (j < countTokens.length) {
-        const next = countTokens[j];
-        if (next === 'N/A' || isNumber(next)) break;
-        annotation += (annotation ? ' ' : '') + next.replace(/^\*/, '');
-        j++;
+      // Validate magic bytes — a block page or redirect HTML would not start with %PDF
+      const magic = buf.slice(0, 4).toString('ascii')
+      if (magic !== '%PDF') {
+        const preview = buf.slice(0, 300).toString('utf-8').replace(/\r?\n/g, ' ')
+        const ct = res.headers.get('content-type') ?? 'unknown'
+        throw new Error(
+          `Downloaded file is not a PDF (starts with ${JSON.stringify(magic)}) — ` +
+          `Content-Type: ${ct} — body: ${preview}`,
+        )
       }
-      bedrooms.push({ count: parseInt(tok, 10), annotation: annotation || null });
-    } else {
-      j++;
+
+      writeFileSync(destPath, buf)
+      console.log(`[ml-snapshot] Downloaded ${buf.length} bytes → ${destPath}`)
+      return destPath
+    } catch (err) {
+      lastErr = err
+      console.error(`[ml-snapshot] Download attempt ${attempt} failed: ${err.message}`)
     }
   }
-  while (bedrooms.length < 5) bedrooms.push({ count: null, annotation: null });
-
-  const dates = dateTokens.map(tok => {
-    if (tok === 'N/A' || !DATE_RE.test(tok)) return null;
-    const [m, d, y] = tok.split('/').map(Number);
-    return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
-  });
-  while (dates.length < 5) dates.push(null);
-
-  return BEDROOM_TYPES.map((size, idx) => ({
-    development: name,
-    bedroom_size: size,
-    last_number_approved: bedrooms[idx]?.count ?? null,
-    annotation: bedrooms[idx]?.annotation ?? null,
-    last_approval_date: dates[idx] ?? null,
-    management_company: management || null,
-    contact_info: contact || null,
-  }));
+  throw new Error(`All ${maxRetries} download attempts failed.\nLast error: ${lastErr.message}`)
 }
 
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 async function main() {
-  const workerUrl = process.env.WORKER_URL;
-  const apiSecret = process.env.API_SECRET;
+  let pdfPath
+
+  if (localFile) {
+    // --file mode: skip download, use the provided path
+    pdfPath = resolve(localFile)
+    console.log(`[ml-snapshot] Using local file: ${pdfPath}`)
+  } else {
+    const workerUrl = process.env.WORKER_URL
+    const apiSecret = process.env.API_SECRET
+    if (!workerUrl || !apiSecret) {
+      console.error(
+        '[ml-snapshot] WORKER_URL and API_SECRET environment variables are required ' +
+        '(or use --file <path> to skip download and POST)',
+      )
+      process.exit(1)
+    }
+    pdfPath = resolve(__dir, 'ml-lna.pdf')
+    await downloadPdf(SOURCE_URL, pdfPath)
+  }
+
+  // parseMitchellLamaLNA is the same function used by scripts/parse-ml-last-number.mjs
+  const result = await parseMitchellLamaLNA(pdfPath)
+
+  const devCount = new Set(result.rows.map(r => r.development)).size
+  console.log(`[ml-snapshot] Parsed ${result.rows.length} rows from ${devCount} developments`)
+  console.log(`[ml-snapshot] PDF updated: ${result.pdf_updated}`)
+
+  // In --file mode without --post, stop here (useful for local testing)
+  if (localFile && !forcePost) {
+    if (!result.pdf_updated) {
+      console.warn(
+        '[ml-snapshot] Warning: "Updated MM/DD/YYYY" header not found in this file ' +
+        '(sample PDFs captured before that header existed will show this).',
+      )
+    }
+    console.log('[ml-snapshot] --file mode: skipping POST. Pass --post to send to Worker.')
+    return
+  }
+
+  if (!result.pdf_updated) {
+    console.error(
+      '[ml-snapshot] Could not find "Updated MM/DD/YYYY" header in PDF. ' +
+      'The PDF format may have changed. Aborting.',
+    )
+    process.exit(1)
+  }
+
+  const workerUrl = process.env.WORKER_URL
+  const apiSecret = process.env.API_SECRET
   if (!workerUrl || !apiSecret) {
-    console.error('[ml-snapshot] WORKER_URL and API_SECRET are required');
-    process.exit(1);
+    console.error('[ml-snapshot] WORKER_URL and API_SECRET are required to POST to Worker')
+    process.exit(1)
   }
 
-  const pdfPath = resolve(__dir, 'ml-lna.pdf');
-  console.log(`[ml-snapshot] Parsing: ${pdfPath}`);
-
-  const raw = await extractText(pdfPath);
-  const { cleaned, pdfUpdated } = cleanText(raw);
-  if (!pdfUpdated) {
-    console.error('[ml-snapshot] Could not extract "Updated" date from PDF — aborting');
-    process.exit(1);
+  const payload = {
+    pdf_updated: result.pdf_updated,
+    source_url: SOURCE_URL,
+    rows: result.rows,
   }
-  console.log(`[ml-snapshot] PDF updated: ${pdfUpdated}`);
 
-  const entries = splitIntoEntries(cleaned);
-  const rows = [];
-  for (const entry of entries) {
-    const result = parseEntry(entry);
-    if (result) rows.push(...result);
-  }
-  console.log(`[ml-snapshot] Parsed ${rows.length} rows from ${new Set(rows.map(r => r.development)).size} developments`);
-
-  const payload = { pdf_updated: pdfUpdated, source_url: SOURCE_URL, rows };
   const res = await fetch(`${workerUrl}/internal/ml-snapshot`, {
     method: 'POST',
     headers: {
@@ -200,21 +162,25 @@ async function main() {
       'X-Api-Secret': apiSecret,
     },
     body: JSON.stringify(payload),
-  });
+  })
 
-  const json = await res.json().catch(() => ({}));
+  const json = await res.json().catch(() => ({}))
   if (!res.ok) {
-    console.error(`[ml-snapshot] Worker returned ${res.status}:`, json);
-    process.exit(1);
+    console.error(`[ml-snapshot] Worker returned ${res.status}:`, JSON.stringify(json))
+    process.exit(1)
   }
   if (json.stored === false) {
-    console.log(`[ml-snapshot] Skipped: ${json.reason} (pdf_updated=${pdfUpdated} already stored)`);
+    console.log(
+      `[ml-snapshot] Skipped: ${json.reason} (pdf_updated=${result.pdf_updated} already stored)`,
+    )
   } else {
-    console.log(`[ml-snapshot] Stored snapshot for ${pdfUpdated} (${json.row_count} rows)`);
+    console.log(
+      `[ml-snapshot] Stored snapshot for ${result.pdf_updated} (${json.row_count} rows)`,
+    )
   }
 }
 
 main().catch(err => {
-  console.error('[ml-snapshot] Fatal:', err.message);
-  process.exit(1);
-});
+  console.error('[ml-snapshot] Fatal:', err.message)
+  process.exit(1)
+})
