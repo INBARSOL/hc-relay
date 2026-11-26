@@ -234,6 +234,66 @@ function log(msg) {
   console.log(`[relay] ${new Date().toISOString()} ${msg}`)
 }
 
+// ---------------------------------------------------------------------------
+// Schema validation — guard against unexpected HC response shape changes.
+// Checks that the response has the arrays we expect and that each listing
+// has the minimum fields we rely on. Throws with a descriptive message so
+// the GitHub Actions run fails and the healthcheck dead-man alert fires.
+// ---------------------------------------------------------------------------
+
+/** Minimum fields required on each search listing. */
+const REQUIRED_LISTING_FIELDS = ['lotteryId', 'borough']
+
+/**
+ * Validate the raw SearchLotteries response.
+ * Returns the flat array of listings (rentals + sales) on success.
+ * Throws with a clear message on any structural problem.
+ */
+export function validateSearchResponse(data) {
+  if (data == null || typeof data !== 'object') {
+    throw new Error('schema error: SearchLotteries response is not an object')
+  }
+  if (!Array.isArray(data.rentals)) {
+    throw new Error('schema error: response.rentals is not an array')
+  }
+  if (!Array.isArray(data.sales)) {
+    throw new Error('schema error: response.sales is not an array')
+  }
+
+  const all = [...data.rentals, ...data.sales]
+
+  // Sample up to 5 listings to check field presence without blocking on huge lists.
+  const sample = all.slice(0, 5)
+  for (const listing of sample) {
+    for (const field of REQUIRED_LISTING_FIELDS) {
+      if (listing[field] == null) {
+        throw new Error(`schema error: listing missing required field "${field}" — HC response may have changed shape`)
+      }
+    }
+  }
+
+  return all
+}
+
+/**
+ * Fetch the current published lottery count from the Worker (before ingesting).
+ * Returns 0 on any error so a network hiccup does not block the ingest.
+ */
+async function fetchPrevCount() {
+  if (!WORKER_URL || !API_SECRET) return 0
+  try {
+    const res = await fetch(`${WORKER_URL}/internal/ingest/count`, {
+      headers: { 'X-Api-Secret': API_SECRET, 'User-Agent': UA },
+      signal: AbortSignal.timeout(10_000),
+    })
+    if (!res.ok) return 0
+    const data = await res.json()
+    return typeof data.count === 'number' ? data.count : 0
+  } catch {
+    return 0
+  }
+}
+
 async function fetchSearch() {
   log('fetching SearchLotteries...')
   const res = await fetch(`${HC_API}SearchLotteries`, {
@@ -252,6 +312,8 @@ async function fetchSearch() {
     throw new Error(`SearchLotteries failed: HTTP ${res.status} — ${body.slice(0, 300)}`)
   }
   const data = await res.json()
+  // Validate shape before proceeding — throws if something unexpected changed.
+  validateSearchResponse(data)
   const count = (data.rentals?.length ?? 0) + (data.sales?.length ?? 0)
   log(`SearchLotteries ok — ${count} listings`)
   return data
@@ -342,21 +404,27 @@ async function main() {
   const listings = [...(searchResponse.rentals ?? []), ...(searchResponse.sales ?? [])]
 
   if (listings.length === 0) {
-    log('WARNING: zero listings returned — skipping ingest')
+    console.error('[relay] FATAL: zero listings returned from Housing Connect — aborting ingest (no withdrawals made)')
     process.exit(1)
   }
 
-  // 2. Get prevCount before any writes (for drop check in /ingest/complete)
-  let prevCount = 0
+  // Pre-ingest drop check: if the new count is <50% of the stored count, something
+  // is wrong with HC (partial outage, WAF block, API change). Fail without ingesting
+  // so ghost-reconciliation never runs and existing listings are preserved.
   if (!DRY_RUN) {
-    // We ask the Worker for the current published count via /health (doesn't expose count)
-    // so we pass prevCount=0 and let the Worker use its own countPublishedLotteries call.
-    // The Worker's /ingest/complete does the count internally — prevCount here is just for
-    // the Worker's reference; we pass the total listing count instead.
-    prevCount = listings.length  // approximation; Worker queries D1 for the real prevCount
+    const prevCount = await fetchPrevCount()
+    if (prevCount >= 10 && listings.length < prevCount / 2) {
+      console.error(
+        `[relay] FATAL: listing count dropped from ${prevCount} to ${listings.length} (>${Math.round((1 - listings.length / prevCount) * 100)}% drop) — aborting ingest (no withdrawals made)`,
+      )
+      process.exit(1)
+    }
+    if (prevCount >= 10) {
+      log(`pre-ingest count check ok — prev=${prevCount} now=${listings.length}`)
+    }
   }
 
-  // 3. POST each listing individually — one Worker invocation per listing
+  // 2. POST each listing individually — one Worker invocation per listing
   let errorCount = 0
   let nearbyCount = 0
   const statuses = {}
@@ -446,7 +514,7 @@ async function main() {
   log(`listings done — ${JSON.stringify(statuses)}, errors: ${errorCount}`)
 
   // 4. Signal completion — Worker does drop check, ghost reconcile, logs watchdog event, pings healthcheck
-  const completeResult = await postComplete(listings.length, errorCount, prevCount, observedIds, globalPhotoStats)
+  const completeResult = await postComplete(listings.length, errorCount, listings.length, observedIds, globalPhotoStats)
   log(`complete: ${JSON.stringify(completeResult)}`)
 
   if (errorCount > 0) {
@@ -455,7 +523,11 @@ async function main() {
   }
 }
 
-main().catch(err => {
-  console.error(`[relay] FATAL: ${err.message}`)
-  process.exit(1)
-})
+// Only run when invoked directly (not when imported by tests).
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]
+if (isMain) {
+  main().catch(err => {
+    console.error(`[relay] FATAL: ${err.message}`)
+    process.exit(1)
+  })
+}
