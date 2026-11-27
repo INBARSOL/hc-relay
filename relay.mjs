@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createHash } from 'node:crypto'
 /**
  * Lotto Lane relay — GitHub Actions runner fetches Housing Connect data
  * (Azure IPs are not blocked by HC's WAF) and POSTs to the Worker one
@@ -374,7 +375,59 @@ async function validatePhotoUrls(urls) {
   return valid
 }
 
-const globalPhotoStats = { validated: 0, failed: 0 }
+const globalPhotoStats = { validated: 0, failed: 0, deduped: 0 }
+
+/**
+ * Per-run URL → SHA-256 cache.  A relay job processes every open listing on
+ * every invocation; without this cache the same photo URL (shared across
+ * listings, or appearing after a relay restart) would be downloaded twice.
+ * Intentionally module-level so it lives for the duration of one job only —
+ * no stale-data risk and no external storage needed.
+ */
+export const _photoHashCache = new Map() // url → hex hash | 'failed'
+
+/**
+ * Deduplicate photos by content hash (SHA-256 of the downloaded bytes).
+ * Requires a full GET; only run after HEAD-validation so every URL is known
+ * to be alive.  Silently keeps a photo if the download fails (safe default).
+ * Results are memoised in _photoHashCache for the duration of the relay run.
+ */
+export async function deduplicateByContentHash(urls) {
+  const seen = new Map() // hash → first url (within this call)
+  const result = []
+  for (const url of urls) {
+    try {
+      let hash = _photoHashCache.get(url)
+      if (hash === undefined) {
+        const res = await fetch(url, {
+          headers: { 'User-Agent': UA },
+          signal: AbortSignal.timeout(10_000),
+        })
+        if (!res.ok) {
+          _photoHashCache.set(url, 'failed')
+          result.push(url)
+          continue
+        }
+        const buf = Buffer.from(await res.arrayBuffer())
+        hash = createHash('sha256').update(buf).digest('hex')
+        _photoHashCache.set(url, hash)
+      }
+      if (hash === 'failed') { result.push(url); continue }
+      if (seen.has(hash)) {
+        log(`INFO: duplicate photo removed (same content as ${seen.get(hash)}): ${url}`)
+        globalPhotoStats.deduped++
+        continue
+      }
+      seen.set(hash, url)
+      result.push(url)
+    } catch (err) {
+      log(`WARNING: photo hash-check failed for ${url}: ${err.message} — keeping it`)
+      _photoHashCache.set(url, 'failed')
+      result.push(url)
+    }
+  }
+  return result
+}
 
 async function postComplete(total, errorCount, prevCount, observedIds, photoStats) {
   const res = await fetch(`${WORKER_URL}/internal/ingest/complete`, {
@@ -472,7 +525,13 @@ async function main() {
     if (Array.isArray(detailData.photos)) {
       const rawUrls = detailData.photos.map(p => p.item1).filter(Boolean)
       const validUrls = await validatePhotoUrls(rawUrls)
-      detailData = { ...detailData, photos: detailData.photos.filter(p => validUrls.includes(p.item1)) }
+      // Remove photos that failed HEAD validation.
+      let validPhotos = detailData.photos.filter(p => validUrls.includes(p.item1))
+      // Deduplicate by content hash — catches same image served under different URLs.
+      const validPhotoUrls = validPhotos.map(p => p.item1)
+      const dedupedUrls = new Set(await deduplicateByContentHash(validPhotoUrls))
+      validPhotos = validPhotos.filter(p => dedupedUrls.has(p.item1))
+      detailData = { ...detailData, photos: validPhotos }
     }
 
     // Compute nearby transit/parks here (GitHub Actions has no CPU limit).
