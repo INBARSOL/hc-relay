@@ -23,8 +23,28 @@ jobs:
         with:
           node-version: '22'
 
+      # Restore the photo-hash cache from the most recent run.
+      # Using separate restore/save actions so we can always save even when
+      # the relay script exits non-zero (errors on individual listings).
+      # Key includes run_number so each run writes a fresh cache entry;
+      # restore-keys picks the latest existing one by prefix.
+      - name: Restore photo hash cache
+        uses: actions/cache/restore@v4
+        with:
+          path: photo-hashes.json
+          key: photo-hashes-${{ runner.os }}-${{ github.run_number }}
+          restore-keys: |
+            photo-hashes-${{ runner.os }}-
+
       - name: Fetch HC data and POST to Worker
         env:
           WORKER_URL: ${{ secrets.WORKER_URL }}
           API_SECRET: ${{ secrets.API_SECRET }}
         run: node relay.mjs
+
+      - name: Save photo hash cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: photo-hashes.json
+          key: photo-hashes-${{ runner.os }}-${{ github.run_number }}

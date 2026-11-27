@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto'
+import { readFileSync, writeFileSync } from 'node:fs'
 /**
  * Lotto Lane relay — GitHub Actions runner fetches Housing Connect data
  * (Azure IPs are not blocked by HC's WAF) and POSTs to the Worker one
@@ -377,42 +378,153 @@ async function validatePhotoUrls(urls) {
 
 const globalPhotoStats = { validated: 0, failed: 0, deduped: 0 }
 
+// ---------------------------------------------------------------------------
+// Persistent photo-hash cache
+// ---------------------------------------------------------------------------
+
+/** Max photo downloads per relay run. URLs beyond the cap are kept as-is. */
+export const DOWNLOAD_CAP = 50
+/** Drop cache entries older than this many days. */
+const CACHE_MAX_AGE_DAYS = 30
+
 /**
- * Per-run URL → SHA-256 cache.  A relay job processes every open listing on
- * every invocation; without this cache the same photo URL (shared across
- * listings, or appearing after a relay restart) would be downloaded twice.
- * Intentionally module-level so it lives for the duration of one job only —
- * no stale-data risk and no external storage needed.
+ * Path to the JSON cache file.  Set PHOTO_HASH_CACHE_PATH in the environment
+ * (or pass explicitly to load/save) to override.  In GitHub Actions the
+ * actions/cache step restores this file before the relay runs and saves it
+ * after, so it persists across runs.
  */
-export const _photoHashCache = new Map() // url → hex hash | 'failed'
+export const PHOTO_HASH_CACHE_FILE =
+  process.env.PHOTO_HASH_CACHE_PATH ?? join(__dirname, 'photo-hashes.json')
+
+/**
+ * In-memory store for the current run.
+ * Each entry: { hash: '<hex>' | 'failed', date: 'YYYY-MM-DD' }
+ *   hash='failed'  — last download attempt failed; retry allowed next day
+ *   hash=<hex>     — SHA-256 of the image bytes; skip download on cache hit
+ */
+export const _photoHashCache = new Map() // url → { hash, date }
+
+/** How many real photo downloads have been made this run. */
+export let _downloadsThisRun = 0
+
+/** Reset per-run counters (used by tests). */
+export function _resetRunCounters() {
+  _downloadsThisRun = 0
+}
+
+/**
+ * Load the persistent cache from disk.  Prunes entries older than
+ * CACHE_MAX_AGE_DAYS and populates _photoHashCache.
+ */
+export function loadPhotoHashCache(filePath = PHOTO_HASH_CACHE_FILE) {
+  try {
+    const raw = JSON.parse(readFileSync(filePath, 'utf-8'))
+    const cutoff = new Date()
+    cutoff.setDate(cutoff.getDate() - CACHE_MAX_AGE_DAYS)
+    const cutoffStr = cutoff.toISOString().slice(0, 10)
+    let loaded = 0, pruned = 0
+    for (const [url, entry] of Object.entries(raw)) {
+      if (typeof entry?.date !== 'string' || entry.date < cutoffStr) {
+        pruned++
+        continue
+      }
+      _photoHashCache.set(url, entry)
+      loaded++
+    }
+    log(`photo-hash cache: loaded ${loaded}, pruned ${pruned} (>${CACHE_MAX_AGE_DAYS} days old)`)
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      log(`WARNING: could not read photo-hash cache (${err.message}) — starting fresh`)
+    }
+  }
+}
+
+/**
+ * Persist _photoHashCache back to disk so the next run can reuse it.
+ * Called at the end of main(); the actions/cache step then archives the file.
+ */
+export function savePhotoHashCache(filePath = PHOTO_HASH_CACHE_FILE) {
+  const obj = {}
+  for (const [url, entry] of _photoHashCache) obj[url] = entry
+  try {
+    writeFileSync(filePath, JSON.stringify(obj, null, 2), 'utf-8')
+    log(`photo-hash cache: saved ${_photoHashCache.size} entries → ${filePath}`)
+  } catch (err) {
+    log(`WARNING: could not save photo-hash cache: ${err.message}`)
+  }
+}
 
 /**
  * Deduplicate photos by content hash (SHA-256 of the downloaded bytes).
- * Requires a full GET; only run after HEAD-validation so every URL is known
- * to be alive.  Silently keeps a photo if the download fails (safe default).
- * Results are memoised in _photoHashCache for the duration of the relay run.
+ *
+ * Cache behaviour:
+ *   - Cache hit (valid hash): skip download, use stored hash for dedup
+ *   - Cache hit ('failed', same day): skip retry, keep URL as-is
+ *   - Cache hit ('failed', earlier day): retry once; update entry
+ *   - Not cached: download, hash, store
+ *
+ * Download cap: at most DOWNLOAD_CAP real GETs per relay run.  URLs beyond
+ * the cap are kept as-is — no duplicate check is possible without the bytes,
+ * so they carry through unchanged.  They will be checked on a future run once
+ * the cache is warm.
+ *
+ * Always safe: a failed download keeps the URL in the result list.
  */
 export async function deduplicateByContentHash(urls) {
-  const seen = new Map() // hash → first url (within this call)
+  const today = new Date().toISOString().slice(0, 10)
+  const seen = new Map() // hash → first url (within this call, for dedup)
   const result = []
+  let cacheHits = 0, downloads = 0, failures = 0, capped = 0
+
   for (const url of urls) {
-    try {
-      let hash = _photoHashCache.get(url)
-      if (hash === undefined) {
-        const res = await fetch(url, {
-          headers: { 'User-Agent': UA },
-          signal: AbortSignal.timeout(10_000),
-        })
-        if (!res.ok) {
-          _photoHashCache.set(url, 'failed')
+    const cached = _photoHashCache.get(url)
+
+    if (cached) {
+      if (cached.hash === 'failed') {
+        if (cached.date === today) {
+          // Already failed today — keep URL, count as cache hit
           result.push(url)
+          cacheHits++
           continue
         }
-        const buf = Buffer.from(await res.arrayBuffer())
-        hash = createHash('sha256').update(buf).digest('hex')
-        _photoHashCache.set(url, hash)
+        // Failed on a prior day — fall through to retry
+      } else {
+        // Valid cached hash — no download needed
+        cacheHits++
+        if (seen.has(cached.hash)) {
+          log(`INFO: duplicate photo removed (same content as ${seen.get(cached.hash)}): ${url}`)
+          globalPhotoStats.deduped++
+          continue
+        }
+        seen.set(cached.hash, url)
+        result.push(url)
+        continue
       }
-      if (hash === 'failed') { result.push(url); continue }
+    }
+
+    // Need to download — check the per-run cap first
+    if (_downloadsThisRun >= DOWNLOAD_CAP) {
+      result.push(url)
+      capped++
+      continue
+    }
+
+    _downloadsThisRun++
+    downloads++
+    try {
+      const res = await fetch(url, {
+        headers: { 'User-Agent': UA },
+        signal: AbortSignal.timeout(10_000),
+      })
+      if (!res.ok) {
+        _photoHashCache.set(url, { hash: 'failed', date: today })
+        result.push(url)
+        failures++
+        continue
+      }
+      const buf = Buffer.from(await res.arrayBuffer())
+      const hash = createHash('sha256').update(buf).digest('hex')
+      _photoHashCache.set(url, { hash, date: today })
       if (seen.has(hash)) {
         log(`INFO: duplicate photo removed (same content as ${seen.get(hash)}): ${url}`)
         globalPhotoStats.deduped++
@@ -422,10 +534,13 @@ export async function deduplicateByContentHash(urls) {
       result.push(url)
     } catch (err) {
       log(`WARNING: photo hash-check failed for ${url}: ${err.message} — keeping it`)
-      _photoHashCache.set(url, 'failed')
+      _photoHashCache.set(url, { hash: 'failed', date: today })
       result.push(url)
+      failures++
     }
   }
+
+  log(`photo dedup: checked=${urls.length} cache_hits=${cacheHits} downloads=${downloads} failures=${failures} deduped=${globalPhotoStats.deduped} capped=${capped}`)
   return result
 }
 
@@ -451,6 +566,9 @@ async function main() {
     if (!WORKER_URL) throw new Error('WORKER_URL is required')
     if (!API_SECRET) throw new Error('API_SECRET is required')
   }
+
+  // Load the persistent photo-hash cache (populated by actions/cache in GHA).
+  loadPhotoHashCache()
 
   // 1. Fetch search
   const searchResponse = await fetchSearch()
@@ -572,7 +690,10 @@ async function main() {
   log(`nearby computed for ${nearbyCount} of ${listings.length} listings`)
   log(`listings done — ${JSON.stringify(statuses)}, errors: ${errorCount}`)
 
-  // 4. Signal completion — Worker does drop check, ghost reconcile, logs watchdog event, pings healthcheck
+  // 4. Persist photo-hash cache so next run can skip already-seen photos.
+  savePhotoHashCache()
+
+  // 5. Signal completion — Worker does drop check, ghost reconcile, logs watchdog event, pings healthcheck
   const completeResult = await postComplete(listings.length, errorCount, listings.length, observedIds, globalPhotoStats)
   log(`complete: ${JSON.stringify(completeResult)}`)
 
